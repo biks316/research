@@ -1,0 +1,872 @@
+openapi: 3.1.0
+info:
+  title: APA Report Generator API
+  version: 1.0.0
+  summary: Generate citation-backed APA 7 research reports from a topic and description.
+  description: |
+    The client submits a topic and description. The API stores the request, queues it
+    for asynchronous processing (SQS), and returns a report ID immediately with
+    `202 Accepted`. The client then follows progress, reviews and approves the research
+    plan (central question and sub-questions), and retrieves the finished report.
+
+    ## Report lifecycle
+
+    ```
+    QUEUED -> PLANNING -> AWAITING_APPROVAL
+      -> (client approves plan) -> QUEUED_FOR_GENERATION
+      -> SEARCHING -> SCREENING -> EXTRACTING -> WRITING -> VERIFYING -> COMPLETED
+    Any active state may end in FAILED. Deleting an active report cancels it.
+    ```
+
+    ## Conventions
+    - All endpoints require a bearer token (JWT).
+    - Errors use RFC 9457 Problem Details (`application/problem+json`).
+    - Timestamps are ISO 8601 in UTC.
+    - Citations in report content are APA 7 in-text citations; every citation maps to an
+      entry in the report's reference list, sourced from OpenAlex metadata.
+servers:
+  - url: https://api.example.com/api/v1
+    description: Production
+  - url: http://localhost:8080/api/v1
+    description: Local development
+security:
+  - bearerAuth: []
+tags:
+  - name: Reports
+    description: Create, list, read and delete reports.
+  - name: Progress
+    description: Follow the processing status of a report.
+  - name: Plan
+    description: Review, edit and approve the research plan before generation.
+  - name: Output
+    description: References and file export for completed reports.
+
+paths:
+  /reports:
+    post:
+      tags: [Reports]
+      operationId: createReport
+      summary: Submit a topic and description to start a report
+      description: |
+        Validates the input, saves the report with status `QUEUED`, sends a planning
+        message to the queue, and returns immediately. Planning runs asynchronously; poll
+        `statusUrl` (or subscribe to events) until the status is `AWAITING_APPROVAL`.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReportCreateRequest'
+            example:
+              topic: Social media and teen mental health
+              description: For my psychology class. I want to know if social media causes anxiety in teenagers and what can be done about it.
+              options:
+                yearFrom: 2010
+                length: STANDARD
+                openAccessOnly: false
+      responses:
+        '202':
+          description: Report accepted and queued for planning.
+          headers:
+            Location:
+              description: URL of the created report.
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReportAccepted'
+              example:
+                id: 7f3a9c2e-5b1d-4e8a-9c3f-2a6b8d0e1f47
+                status: QUEUED
+                statusUrl: /api/v1/reports/7f3a9c2e-5b1d-4e8a-9c3f-2a6b8d0e1f47/status
+                createdAt: '2026-10-17T19:08:00Z'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '409':
+          description: The Idempotency-Key was reused with a different request body.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+    get:
+      tags: [Reports]
+      operationId: listReports
+      summary: List the current user's reports
+      parameters:
+        - name: status
+          in: query
+          description: Filter by status.
+          schema:
+            $ref: '#/components/schemas/ReportStatus'
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+        - name: cursor
+          in: query
+          description: Opaque cursor from a previous response's `nextCursor`.
+          schema:
+            type: string
+      responses:
+        '200':
+          description: A page of reports, newest first.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReportPage'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /reports/{reportId}:
+    parameters:
+      - $ref: '#/components/parameters/ReportId'
+    get:
+      tags: [Reports]
+      operationId: getReport
+      summary: Get the full report
+      description: Returns the generated report. Only available when status is `COMPLETED`.
+      responses:
+        '200':
+          description: The completed report.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Report'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/NotReady'
+    delete:
+      tags: [Reports]
+      operationId: deleteReport
+      summary: Delete a report
+      description: Deletes the report and its data. If the report is still processing, the job is cancelled first.
+      responses:
+        '204':
+          description: Report deleted.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /reports/{reportId}/status:
+    parameters:
+      - $ref: '#/components/parameters/ReportId'
+    get:
+      tags: [Progress]
+      operationId: getReportStatus
+      summary: Get current status and progress
+      description: Lightweight endpoint intended for polling (recommended interval 3-5 seconds).
+      responses:
+        '200':
+          description: Current status.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReportStatusResponse'
+              example:
+                id: 7f3a9c2e-5b1d-4e8a-9c3f-2a6b8d0e1f47
+                status: SCREENING
+                progressPercent: 45
+                message: Screening 124 candidate papers
+                updatedAt: '2026-10-17T19:11:42Z'
+                error: null
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /reports/{reportId}/events:
+    parameters:
+      - $ref: '#/components/parameters/ReportId'
+    get:
+      tags: [Progress]
+      operationId: streamReportEvents
+      summary: Stream live progress events (Server-Sent Events)
+      description: |
+        Opens a Server-Sent Events stream. Each event has `event: progress` and a JSON
+        `data` payload matching the `ProgressEvent` schema. The stream closes after a
+        terminal status (`AWAITING_APPROVAL`, `COMPLETED`, `FAILED`). Clients that cannot
+        use SSE should poll `/status` instead.
+      responses:
+        '200':
+          description: Event stream.
+          content:
+            text/event-stream:
+              schema:
+                type: string
+                description: SSE stream; each `data` line is a JSON-encoded ProgressEvent.
+              example: |
+                event: progress
+                data: {"status":"SEARCHING","progressPercent":20,"message":"Searching OpenAlex for sub-question 2 of 5","timestamp":"2026-10-17T19:10:05Z"}
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /reports/{reportId}/plan:
+    parameters:
+      - $ref: '#/components/parameters/ReportId'
+    get:
+      tags: [Plan]
+      operationId: getPlan
+      summary: Get the research plan
+      description: Available once status reaches `AWAITING_APPROVAL` and afterwards (read-only after approval).
+      responses:
+        '200':
+          description: The research plan.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Plan'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/NotReady'
+    put:
+      tags: [Plan]
+      operationId: updatePlan
+      summary: Edit the research plan before approval
+      description: |
+        Replaces the central question and sub-questions. Only allowed while status is
+        `AWAITING_APPROVAL`. Send the `version` you last read; a mismatch returns 409
+        (optimistic locking). The response contains the new version.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PlanUpdateRequest'
+      responses:
+        '200':
+          description: Updated plan.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Plan'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /reports/{reportId}/plan/approve:
+    parameters:
+      - $ref: '#/components/parameters/ReportId'
+    post:
+      tags: [Plan]
+      operationId: approvePlan
+      summary: Approve the plan and start full report generation
+      description: |
+        Locks the plan, sets status to `QUEUED_FOR_GENERATION` and sends the generation
+        message to the queue. Only allowed while status is `AWAITING_APPROVAL`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PlanApprovalRequest'
+      responses:
+        '202':
+          description: Plan approved; generation queued.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReportAccepted'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /reports/{reportId}/references:
+    parameters:
+      - $ref: '#/components/parameters/ReportId'
+    get:
+      tags: [Output]
+      operationId: getReferences
+      summary: Get the report's reference list with paper details
+      description: APA 7 references sorted alphabetically by first author, as in the report.
+      responses:
+        '200':
+          description: Reference list.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReferenceList'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/NotReady'
+
+  /reports/{reportId}/export:
+    parameters:
+      - $ref: '#/components/parameters/ReportId'
+    get:
+      tags: [Output]
+      operationId: exportReport
+      summary: Download the report as a file
+      parameters:
+        - name: format
+          in: query
+          required: true
+          schema:
+            type: string
+            enum: [docx, pdf]
+      responses:
+        '200':
+          description: The report file.
+          headers:
+            Content-Disposition:
+              description: 'attachment; filename="<report-title>.<ext>"'
+              schema:
+                type: string
+          content:
+            application/vnd.openxmlformats-officedocument.wordprocessingml.document:
+              schema:
+                type: string
+                contentMediaType: application/vnd.openxmlformats-officedocument.wordprocessingml.document
+            application/pdf:
+              schema:
+                type: string
+                contentMediaType: application/pdf
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/NotReady'
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  parameters:
+    ReportId:
+      name: reportId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      description: |
+        Client-generated unique key (e.g. UUID) per submission. Repeating a request with
+        the same key and body returns the original report instead of creating a new one.
+        Keys are retained for 24 hours.
+      schema:
+        type: string
+        maxLength: 128
+
+  responses:
+    ValidationError:
+      description: The request is invalid.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: https://api.example.com/problems/validation-error
+            title: Validation failed
+            status: 400
+            detail: description must be at least 10 characters
+            code: VALIDATION_ERROR
+            errors:
+              - field: description
+                message: must be at least 10 characters
+    Unauthorized:
+      description: Missing or invalid token.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    NotFound:
+      description: Report not found or not owned by the caller.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    NotReady:
+      description: The resource is not available in the report's current status.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: https://api.example.com/problems/report-not-ready
+            title: Report not ready
+            status: 409
+            detail: Report is in status WRITING; this resource is available when COMPLETED.
+            code: REPORT_NOT_READY
+    Conflict:
+      description: Operation not allowed in the current status, or plan version mismatch.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: https://api.example.com/problems/plan-version-conflict
+            title: Plan version conflict
+            status: 409
+            detail: Plan was modified (current version 3, request version 2). Reload and retry.
+            code: PLAN_VERSION_CONFLICT
+    TooManyRequests:
+      description: Rate limit or plan quota exceeded.
+      headers:
+        Retry-After:
+          description: Seconds to wait before retrying.
+          schema:
+            type: integer
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+
+  schemas:
+    ReportStatus:
+      type: string
+      enum:
+        - QUEUED
+        - PLANNING
+        - AWAITING_APPROVAL
+        - QUEUED_FOR_GENERATION
+        - SEARCHING
+        - SCREENING
+        - EXTRACTING
+        - WRITING
+        - VERIFYING
+        - COMPLETED
+        - FAILED
+        - CANCELLED
+
+    ReportOptions:
+      type: object
+      additionalProperties: false
+      properties:
+        yearFrom:
+          type: integer
+          minimum: 1900
+          description: Earliest publication year to include.
+        yearTo:
+          type: integer
+          minimum: 1900
+          description: Latest publication year to include. Defaults to the current year.
+        length:
+          type: string
+          enum: [SHORT, STANDARD, LONG]
+          default: STANDARD
+          description: 'Approximate length: SHORT ~1,500 words, STANDARD ~3,000, LONG ~5,000.'
+        openAccessOnly:
+          type: boolean
+          default: false
+        language:
+          type: string
+          default: en
+          description: ISO 639-1 language code for included sources.
+        citationStyle:
+          type: string
+          enum: [APA7]
+          default: APA7
+
+    ReportCreateRequest:
+      type: object
+      additionalProperties: false
+      required: [topic, description]
+      properties:
+        topic:
+          type: string
+          minLength: 3
+          maxLength: 300
+        description:
+          type: string
+          minLength: 10
+          maxLength: 4000
+          description: What the user wants to know, audience, and any focus or constraints.
+        options:
+          $ref: '#/components/schemas/ReportOptions'
+
+    ReportAccepted:
+      type: object
+      required: [id, status, statusUrl]
+      properties:
+        id:
+          type: string
+          format: uuid
+        status:
+          $ref: '#/components/schemas/ReportStatus'
+        statusUrl:
+          type: string
+        createdAt:
+          type: string
+          format: date-time
+
+    ErrorInfo:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          examples: [RETRIEVAL_FAILED, INSUFFICIENT_SOURCES, LLM_UNAVAILABLE, INTERNAL_ERROR]
+        message:
+          type: string
+
+    ReportStatusResponse:
+      type: object
+      required: [id, status, progressPercent, updatedAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        status:
+          $ref: '#/components/schemas/ReportStatus'
+        progressPercent:
+          type: integer
+          minimum: 0
+          maximum: 100
+        message:
+          type: [string, 'null']
+          description: Human-readable description of the current step.
+        updatedAt:
+          type: string
+          format: date-time
+        error:
+          description: Present only when status is FAILED.
+          oneOf:
+            - $ref: '#/components/schemas/ErrorInfo'
+            - type: 'null'
+
+    ProgressEvent:
+      type: object
+      description: Payload of each Server-Sent Event on /reports/{reportId}/events.
+      required: [status, progressPercent, timestamp]
+      properties:
+        status:
+          $ref: '#/components/schemas/ReportStatus'
+        progressPercent:
+          type: integer
+          minimum: 0
+          maximum: 100
+        message:
+          type: string
+        timestamp:
+          type: string
+          format: date-time
+
+    ReportSummary:
+      type: object
+      required: [id, topic, status, createdAt, updatedAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        topic:
+          type: string
+        title:
+          type: [string, 'null']
+          description: Report title, available once generated.
+        status:
+          $ref: '#/components/schemas/ReportStatus'
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+
+    ReportPage:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/ReportSummary'
+        nextCursor:
+          type: [string, 'null']
+          description: Pass as `cursor` to get the next page; null when there are no more.
+
+    SubQuestion:
+      type: object
+      required: [id, order, question, role]
+      properties:
+        id:
+          type: string
+        order:
+          type: integer
+          minimum: 1
+        question:
+          type: string
+        rationale:
+          type: string
+          description: Why this sub-question is needed to answer the central question.
+        role:
+          type: string
+          enum: [BACKGROUND, CORE, DISCUSSION]
+          description: 'Where it appears: introduction background, a body section, or the discussion.'
+
+    Plan:
+      type: object
+      required: [centralQuestion, subQuestions, version, editable]
+      properties:
+        centralQuestion:
+          type: string
+        interpretationNote:
+          type: [string, 'null']
+          description: How the topic was interpreted or narrowed, shown to the user for confirmation.
+        subQuestions:
+          type: array
+          minItems: 1
+          maxItems: 8
+          items:
+            $ref: '#/components/schemas/SubQuestion'
+        version:
+          type: integer
+          minimum: 1
+          description: Incremented on each edit; used for optimistic locking.
+        editable:
+          type: boolean
+          description: True only while status is AWAITING_APPROVAL.
+
+    SubQuestionInput:
+      type: object
+      additionalProperties: false
+      required: [question, role]
+      properties:
+        id:
+          type: string
+          description: Omit for new sub-questions; include to keep an existing one.
+        question:
+          type: string
+          minLength: 10
+          maxLength: 500
+        rationale:
+          type: string
+          maxLength: 1000
+        role:
+          type: string
+          enum: [BACKGROUND, CORE, DISCUSSION]
+
+    PlanUpdateRequest:
+      type: object
+      additionalProperties: false
+      required: [version, centralQuestion, subQuestions]
+      properties:
+        version:
+          type: integer
+          minimum: 1
+          description: The plan version this edit is based on.
+        centralQuestion:
+          type: string
+          minLength: 10
+          maxLength: 500
+        subQuestions:
+          type: array
+          minItems: 1
+          maxItems: 8
+          description: Full ordered list; array order becomes the section order.
+          items:
+            $ref: '#/components/schemas/SubQuestionInput'
+
+    PlanApprovalRequest:
+      type: object
+      additionalProperties: false
+      required: [version]
+      properties:
+        version:
+          type: integer
+          minimum: 1
+          description: The plan version being approved; must match the current version.
+
+    ReportSection:
+      type: object
+      required: [id, order, heading, content]
+      properties:
+        id:
+          type: string
+        order:
+          type: integer
+          minimum: 1
+        heading:
+          type: string
+        subQuestionId:
+          type: [string, 'null']
+          description: The sub-question this section answers, if any.
+        content:
+          type: string
+          description: Section body in Markdown with APA 7 in-text citations, e.g. "(Smith & Lee, 2021)".
+
+    Methodology:
+      type: object
+      required: [database, searchedAt, papersScreened, papersIncluded]
+      properties:
+        database:
+          type: string
+          examples: [OpenAlex]
+        searchedAt:
+          type: string
+          format: date-time
+        yearRange:
+          type: string
+          examples: [2010-2026]
+        papersScreened:
+          type: integer
+          minimum: 0
+        papersIncluded:
+          type: integer
+          minimum: 0
+
+    Report:
+      type: object
+      required: [id, status, title, topic, centralQuestion, sections, references, methodology, createdAt, completedAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        status:
+          $ref: '#/components/schemas/ReportStatus'
+        title:
+          type: string
+        topic:
+          type: string
+        centralQuestion:
+          type: string
+        abstract:
+          type: string
+          description: APA abstract (about 150-250 words).
+        keywords:
+          type: array
+          items:
+            type: string
+        sections:
+          type: array
+          description: Ordered sections, including Introduction, body sections, Discussion, Limitations and Conclusion.
+          items:
+            $ref: '#/components/schemas/ReportSection'
+        references:
+          type: array
+          items:
+            $ref: '#/components/schemas/Reference'
+        methodology:
+          $ref: '#/components/schemas/Methodology'
+        createdAt:
+          type: string
+          format: date-time
+        completedAt:
+          type: string
+          format: date-time
+
+    Author:
+      type: object
+      required: [family]
+      properties:
+        family:
+          type: string
+        given:
+          type: [string, 'null']
+
+    Reference:
+      type: object
+      required: [id, apaCitation, inTextCitation, authors, title]
+      properties:
+        id:
+          type: string
+          description: OpenAlex work ID.
+          examples: [W2741809807]
+        apaCitation:
+          type: string
+          description: Fully formatted APA 7 reference entry.
+        inTextCitation:
+          type: string
+          description: Parenthetical in-text form, e.g. "(Smith et al., 2021)".
+        authors:
+          type: array
+          items:
+            $ref: '#/components/schemas/Author'
+        year:
+          type: [integer, 'null']
+        title:
+          type: string
+        source:
+          type: [string, 'null']
+          description: Journal, book or repository name.
+        volume:
+          type: [string, 'null']
+        issue:
+          type: [string, 'null']
+        pages:
+          type: [string, 'null']
+        doi:
+          type: [string, 'null']
+          description: DOI as a URL, e.g. https://doi.org/10.1000/xyz123
+        url:
+          type: [string, 'null']
+        isOpenAccess:
+          type: boolean
+
+    ReferenceList:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Reference'
+
+    Problem:
+      type: object
+      description: RFC 9457 Problem Details.
+      required: [title, status]
+      properties:
+        type:
+          type: string
+          format: uri
+        title:
+          type: string
+        status:
+          type: integer
+        detail:
+          type: string
+        instance:
+          type: string
+        code:
+          type: string
+          description: Stable machine-readable error code.
+        errors:
+          type: array
+          description: Field-level validation errors.
+          items:
+            type: object
+            required: [field, message]
+            properties:
+              field:
+                type: string
+              message:
+                type: string

@@ -1,0 +1,99 @@
+# Local stack: API, planning worker, generation worker, Postgres, Redis, LocalStack (SQS + S3).
+# Settings come from .env (copy .env.example); the values below only point services at each other.
+
+x-app: &app
+  build: .
+  image: apa-report-api:local
+  env_file: .env
+  environment: &app-env
+    DATABASE_URL: postgresql+asyncpg://apa:apa@postgres:5432/apa_reports
+    REDIS_URL: redis://redis:6379/0
+    AWS_ENDPOINT_URL: http://localstack:4566
+    AWS_REGION: us-east-1
+    AWS_ACCESS_KEY_ID: test
+    AWS_SECRET_ACCESS_KEY: test
+    SQS_PLANNING_QUEUE_URL: http://localstack:4566/000000000000/apa-planning
+    SQS_GENERATION_QUEUE_URL: http://localstack:4566/000000000000/apa-generation
+    S3_EXPORTS_BUCKET: apa-report-exports
+  depends_on:
+    postgres:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+    localstack:
+      condition: service_healthy
+    migrate:
+      condition: service_completed_successfully
+  restart: unless-stopped
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: apa
+      POSTGRES_PASSWORD: apa
+      POSTGRES_DB: apa_reports
+    ports: ["5432:5432"]
+    volumes: [pgdata:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U apa -d apa_reports"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    ports: ["6379:6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  localstack:
+    image: localstack/localstack:3.8
+    environment:
+      SERVICES: sqs,s3
+      AWS_DEFAULT_REGION: us-east-1
+    ports: ["4566:4566"]
+    volumes:
+      - ./scripts/localstack-init.sh:/etc/localstack/init/ready.d/init-aws.sh:ro
+    healthcheck:
+      # Healthy only after the init script has created the queues and bucket.
+      test: ["CMD-SHELL", "curl -fs http://localhost:4566/_localstack/init/ready | grep -q '\"completed\": true'"]
+      interval: 3s
+      timeout: 5s
+      retries: 40
+
+  migrate:
+    build: .
+    image: apa-report-api:local
+    env_file: .env
+    environment: *app-env
+    command: ["alembic", "upgrade", "head"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  api:
+    <<: *app
+    ports: ["8080:8080"]
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://localhost:8080/ready"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  worker-planning:
+    <<: *app
+    command: ["python", "-m", "app.workers.consumer", "--queue", "planning"]
+    stop_grace_period: 30s
+
+  worker-generation:
+    <<: *app
+    command: ["python", "-m", "app.workers.consumer", "--queue", "generation"]
+    stop_grace_period: 30s
+
+volumes:
+  pgdata:
